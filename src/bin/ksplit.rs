@@ -1,27 +1,39 @@
+#![forbid(unsafe_code)]
 extern crate yaml_rust;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::prelude::*;
 use std::io::{self, Read};
 use yaml_rust::yaml::Hash;
-use yaml_rust::{Yaml, YamlLoader};
+use yaml_rust::{Yaml, YamlEmitter, YamlLoader};
 
-fn main() {
-    let docs = slurp(&mut io::stdin()).unwrap();
+fn main() -> Result<()> {
+    let docs = slurp(&mut io::stdin())?;
     let by_file = split_to_files(&docs);
     for (key, value) in by_file {
-        println!("{} / {:?}", key, value);
+        let filename = format!("{}.yaml", key);
+        dump(&filename, value)?;
+        print!("Wrote {}", filename);
     }
+    Ok(())
 }
 
-fn split_to_files<'a>(docs: &'a Vec<Yaml>) -> HashMap<&'a String, &'a Yaml> {
+fn dump(path: &String, document: &Yaml) -> Result<()> {
+    let mut dumped = String::new();
+    let mut emitter = YamlEmitter::new(&mut dumped);
+    emitter.dump(document)?;
+    let mut file = File::create(path)?;
+    file.write_all(&dumped.into_bytes()[..])?;
+    Ok(())
+}
+
+fn split_to_files<'a>(docs: &'a Vec<Yaml>) -> HashMap<String, &'a Yaml> {
     docs.iter()
         .map(|y| match y {
             Yaml::Hash(hash) => {
-                hash.get(&Yaml::String("kind".to_string()))
-                    .and_then(|val| match val {
-                        Yaml::String(x) => Some((x, y)),
-                        _ => None,
-                    })
+                let key = map_doc_to_file(hash)?;
+                Some((key, y))
             }
             _ => None,
         })
@@ -30,19 +42,20 @@ fn split_to_files<'a>(docs: &'a Vec<Yaml>) -> HashMap<&'a String, &'a Yaml> {
         .collect()
 }
 
-fn get_yaml_str<'a>(hash: &'a Hash, key: &str) -> Option<&'a String> {
+fn get_yaml_str(hash: &Hash, key: &str) -> Option<String> {
     hash.get(&Yaml::String(key.to_string()))
         .and_then(|val| match val {
-            Yaml::String(x) => Some(x),
+            Yaml::String(x) => Some(x.clone()),
             _ => None,
         })
 }
 
 fn map_doc_to_file(hash: &Hash) -> Option<String> {
-    let version = get_yaml_str(hash, "apiVersion");
+    let version = get_yaml_str(hash, "apiVersion").map(|x| x.replace("/", "__"));
     let kind = get_yaml_str(hash, "kind");
     // We'll only early return if metadata.name and metadata.generatedName are absent,
     // since in that case there is nothing that uniquely identifies the object.
+    // This means early returning if metadata itself is absent, of course.
     let metadata = hash
         .get(&Yaml::String("metadata".to_string()))
         .and_then(|m| match m {
@@ -51,7 +64,16 @@ fn map_doc_to_file(hash: &Hash) -> Option<String> {
         })?;
     let namespace = get_yaml_str(metadata, "namespace");
     let name = get_yaml_str(metadata, "name").or_else(|| get_yaml_str(metadata, "generateName"))?;
-    None
+    Some(
+        [version, kind, namespace, Some(name)]
+            .iter()
+            .filter(|o| o.is_some())
+            .map(|o| o.as_ref().expect("Getting filename failed unexpectedly"))
+            .fold("".to_string(), |acc, x| match &*acc {
+                "" => x.clone(),
+                _ => format!("{}__{}", acc, x),
+            }),
+    )
 }
 
 fn slurp(reader: &mut dyn Read) -> Result<Vec<Yaml>> {
